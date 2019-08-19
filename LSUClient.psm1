@@ -30,6 +30,8 @@ $DependencyHardwareTable = @{
 }
 
 [int]$XMLTreeDepth = 0
+[System.IO.DirectoryInfo]$LSUClientPath = "$env:ProgramData\LSUClient"
+[System.IO.FileInfo]$LSUClientHistoryPath = Join-Path -Path $LSUClientPath -ChildPath "lsu-history.xml"
 
 class LenovoPackage {
     [string]$ID
@@ -43,6 +45,18 @@ class LenovoPackage {
     [PackageExtractInfo]$Extracter
     [PackageInstallInfo]$Installer
     [bool]$IsApplicable
+    [bool]$IsInstalled
+    [version]$DetectedVersion
+}
+
+class LenovoHistoryItem {
+    [string]$ID
+    [string]$Category
+    [string]$Title
+    [version]$Version
+    [bool]$IsInstalled
+    [datetime]$UpdatedAt
+    [string]$ErrorMessage
 }
 
 class PackageExtractInfo {
@@ -66,7 +80,7 @@ class PackageInstallInfo {
     [int64[]]$SuccessCodes
     [string]$InfFile
     [string]$Command
-    
+
     PackageInstallInfo ([System.Xml.XmlElement]$PackageXML, [string]$Category) {
         $this.InstallType    = $PackageXML.Install.type
         $this.SuccessCodes   = $PackageXML.Install.rc -split ','
@@ -222,10 +236,10 @@ function Resolve-XMLDependencies {
         [switch]$FailUnsupportedDependencies,
         [string]$DebugLogFile
     )
-    
+
     $XMLTreeDepth++
     [DependencyParserState]$ParserState = 0
-    
+
     foreach ($XMLTREE in $XMLIN) {
         switch -Regex ($XMLTREE.SchemaInfo.Name) {
             '^_' {
@@ -238,7 +252,7 @@ function Resolve-XMLDependencies {
                 }
             }
         }
-        
+
         $Results = if ($XMLTREE.HasChildNodes -and $XMLTREE.ChildNodes) {
             if ($DebugLogFile) {
                 Add-Content -LiteralPath $DebugLogFile -Value "$('- ' * $XMLTreeDepth)$($XMLTREE.SchemaInfo.Name) has more children --> $($XMLTREE.ChildNodes)"
@@ -259,7 +273,7 @@ function Resolve-XMLDependencies {
             switch ($XMLTREE.SchemaInfo.Name) {
                 'And' {
                     if ($DebugLogFile) {
-                        Add-Content -LiteralPath $DebugLogFile -Value "$('- ' * $XMLTreeDepth)Tree was AND: Results: $subtreeresults" 
+                        Add-Content -LiteralPath $DebugLogFile -Value "$('- ' * $XMLTreeDepth)Tree was AND: Results: $subtreeresults"
                     }
                     if ($subtreeresults -contains $false) { $false } else { $true  }
                 }
@@ -359,11 +373,155 @@ function Set-BIOSUpdateRegistryFlag {
     }
 }
 
+function Test-LSUHistoryPath {
+    # create folder if it doesn't exist
+    if (-not (Test-Path -Path $LSUClientPath -PathType Container)) {
+        Write-Verbose "LSUClient directory did not exist, created it: '$LSUClientPath'`r`n"
+        $null = New-Item -Path $LSUClientPath -Force -ItemType Directory
+    }
+
+    # create lsu-history.xml file if it doesn't exist
+    if (-not (Test-Path -Path $LSUClientHistoryPath -PathType Leaf)) {
+        Write-Verbose "LSU history file did not exist, created it: '$LSUClientHistoryPath'`r`n"
+        $null = New-Item -Path $LSUClientHistoryPath -Force -ItemType File
+        $initialArray = [System.Collections.ArrayList]::new()
+        Save-LSUHistory -History $initialArray
+    }
+}
+
+function Test-LSUCachePath {
+    param (
+        [string]$Filename
+    )
+    $path = Get-LSUCachePath -Filename $Filename
+    Test-Path -Path $path -PathType Leaf
+}
+
+function Get-LSUHistory {
+    param (
+        [string]$PackageId
+    )
+    # ensure history file existsp
+    Test-LSUHistoryPath
+    # import data from file
+    $data = Import-CliXml $LSUClientHistoryPath
+    if ([string]::IsNullOrEmpty($PackageId)) {
+        return $data
+    } else {
+        return $data | Where-Object { $_.ID -eq $PackageId }
+    }
+}
+
+function Save-LSUHistory {
+    [CmdletBinding()]
+    Param (
+        [LenovoHistoryItem[]]$History
+    )
+    # ensure history file exists
+    Test-LSUHistoryPath
+    # export new content to file
+    Export-CliXml -InputObject $History -Path $LSUClientHistoryPath
+}
+
+function Update-LSUHistory {
+    Param(
+        [pscustomobject]$Package,
+        [string]$ErrorMessage = ""
+    )
+    [LenovoHistoryItem[]]$history = Get-LSUHistory
+    $historyItem = [LenovoHistoryItem]::new()
+    $historyItem.ID = $Package.ID
+    $historyItem.Title = $Package.Title
+    $historyItem.Category = $Package.Category
+    $historyItem.Version = $Package.Version
+    $historyItem.IsInstalled = $Package.IsInstalled
+    $historyItem.ErrorMessage = $ErrorMessage
+    $historyItem.UpdatedAt = Get-Date
+
+    # if the package doesn't exist in the file, then insert it
+    # otherwise update the object with the new version
+    $existingItem = $history | Where-Object { $_.ID -eq $Package.ID }
+    if ($null -eq $existingItem) {
+        $history += $historyItem
+    }
+    else {
+        if ($history.length -eq 1) {
+                $history = $historyItem
+        } else {
+                $index = $history.IndexOf($existingItem)
+                $history[$index] = $historyItem
+        }
+    }
+
+    Save-LSUHistory -History $history
+}
+
+function Get-LSUCachePath {
+    param (
+        [string]$Filename
+    )
+    return "$LSUClientPath/$Filename"
+}
+
+function Update-LSUCache {
+    param(
+        [string]$Filename,
+        [LenovoPackage[]]$Packages
+    )
+    # ensure cache file exists
+    if (-not (Test-LSUCachePath -Filename $Filename)) {
+        Write-Verbose "Cache file does not exist. Creating $Filename."
+        New-LSUCache -Filename $Filename
+    }
+    # export new content to file
+    $path = Get-LSUCachePath -Filename $Filename
+    Export-Clixml -InputObject $Packages -Path $path
+}
+
+function New-LSUCache {
+    param (
+        [string]$Filename
+    )
+    $filePath = Get-LSUCachePath -Filename $Filename
+    if (-not (Test-Path -Path $filePath -PathType Leaf)) {
+        Write-Verbose "LSU cache file $Filename did not exist, created it: '$filePath'`r`n"
+        $null = New-Item -Path $filePath -Force -ItemType File
+    }
+}
+
+function Get-LSUCache {
+    param (
+        [string]$Filename
+    )
+    # ensure history file exists
+    if (-not (Test-LSUCachePath -Filename $Filename)) {
+        Write-Verbose "Cache file does not exist"
+        return
+    }
+    Try {
+        # import data from file
+        $path = Get-LSUCachePath -Filename $Filename
+        Import-CliXml $path
+    }
+    Catch {
+        Write-Verbose "Error retrieving contents of cache file"
+    }
+}
+
+function Remove-LSUCache {
+    param (
+        [string]$Filename
+    )
+    $path = Get-LSUCachePath -Filename $Filename
+    Remove-Item $path
+}
+
+
 function Get-LSUpdate {
     <#
         .SYNOPSIS
         Fetches available driver packages and updates for Lenovo computers
-        
+
         .PARAMETER Model
         Specify an alternative Lenovo Computer Model to retrieve update packages for.
         You may want to use this together with '-All' so that packages are not filtered against your local machines configuration.
@@ -382,12 +540,15 @@ function Get-LSUpdate {
         .PARAMETER All
         Return all updates, regardless of whether they are applicable to this specific machine or whether they are already installed.
         E.g. this will retrieve LTE-Modem drivers even for machines that do not have the optional LTE-Modem installed. Installation of such drivers will likely still fail.
-        
+
         .PARAMETER FailUnsupportedDependencies
         Lenovo has different kinds of dependencies they specify for each package. This script makes a best effort to parse, understand and check these.
         However, new kinds of dependencies may be added at any point and some currently in use are not supported yet either. By default, any unknown
         dependency will be treated as met/OK. This switch will fail all dependencies we can't actually check. Typically, an update installation
         will simply fail if there really was a dependency missing.
+
+        .PARAMETER CacheFile
+        Optionally pass in a cache file that to retrieve a list of package updates.
     #>
 
     [CmdletBinding()]
@@ -400,8 +561,19 @@ function Get-LSUpdate {
         [switch]$All,
         [switch]$FailUnsupportedDependencies,
         [ValidateScript({ try { [System.IO.File]::Create("$_").Dispose(); $true} catch { $false } })]
-        [string]$DebugLogFile
+        [string]$DebugLogFile,
+        [string]$CacheFile
+
     )
+
+    # if cache exists return the contents of the cache file
+    if ($CacheFile -ne $null) {
+        Write-Verbose "Returning package updates from cache"
+        $cachedPackages = Get-LSUCache -Filename $CacheFile
+        if ($null -ne $cachedPackages) {
+            return $cachedPackages
+        }
+    }
 
     if (-not (Test-RunningAsAdmin)) {
         Write-Warning "Unfortunately, this command produces most accurate results when run as an Administrator`r`nbecause some of the commands Lenovo uses to detect your computers hardware have to run as admin :("
@@ -414,14 +586,17 @@ function Get-LSUpdate {
         }
         $Model = $MODELREGEX.Value
     }
-    
+
     Write-Verbose "Lenovo Model is: $Model`r`n"
     if ($DebugLogFile) {
         Add-Content -LiteralPath $DebugLogFile -Value "Lenovo Model is: $Model"
     }
 
-    $webClient = New-WebClient -Proxy $Proxy -ProxyCredential $ProxyCredential -ProxyUseDefaultCredentials $ProxyUseDefaultCredentials
-    
+    $webClient = [System.Net.WebClient]::new()
+    if ($Proxy) {
+        $webClient = New-WebClient -Proxy $Proxy -ProxyCredential $ProxyCredential -ProxyUseDefaultCredentials $ProxyUseDefaultCredentials
+    }
+
     try {
         $COMPUTERXML = $webClient.DownloadString("https://download.lenovo.com/catalog/${Model}_Win10.xml")
     }
@@ -440,11 +615,14 @@ function Get-LSUpdate {
 
     Write-Verbose "A total of $($PARSEDXML.packages.count) driver packages are available for this computer model."
 
-    foreach ($packageURL in $PARSEDXML.packages.package) {
+    # get the current history of installed lenovo packages
+    $packageHistory = Get-LSUHistory
+
+    [LenovoPackage[]]$packagesCollection = foreach ($packageURL in $PARSEDXML.packages.package) {
         $rawPackageXML           = $webClient.DownloadString($packageURL.location)
         [xml]$packageXML         = $rawPackageXML -replace "^$UTF8ByteOrderMark"
         $DownloadedExternalFiles = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
-        
+
         if ($packageXML.Package.Files.External) {
             # Downloading files needed by external detection in package dependencies
             foreach ($externalFile in $packageXML.Package.Files.External.ChildNodes) {
@@ -457,32 +635,47 @@ function Get-LSUpdate {
         if ($DebugLogFile) {
             Add-Content -LiteralPath $DebugLogFile -Value "Parsing dependencies for package: $($packageXML.Package.id)`r`n"
         }
-        
-        $packageObject = [LenovoPackage]@{
-            'ID'           = $packageXML.Package.id
-            'Category'     = $packageURL.category
-            'Title'        = $packageXML.Package.Title.Desc.'#text'
-            'Version'      = if ([Version]::TryParse($packageXML.Package.version, [ref]$null)) { $packageXML.Package.version } else { '0.0.0.0' }
-            'Vendor'       = $packageXML.Package.Vendor
-            'Severity'     = $packageXML.Package.Severity.type
-            'RebootType'   = $packageXML.Package.Reboot.type
-            'URL'          = $packageURL.location
-            'Extracter'    = $packageXML.Package
-            'Installer'    = [PackageInstallInfo]::new($packageXML.Package, $packageURL.category)
-            'IsApplicable' = Resolve-XMLDependencies -PackageID $packageXML.Package.id -XML $packageXML.Package.Dependencies -FailUnsupportedDependencies:$FailUnsupportedDependencies -DebugLogFile $DebugLogFile
-        }
 
-        if ($All -or $packageObject.IsApplicable) {
-            $packageObject
-        }
+        $version = if ([Version]::TryParse($packageXML.Package.version, [ref]$null)) { $packageXML.Package.version } else { '0.0.0.0' }
+
+        # attempt to retrieve the current package from the history file so that we can determine if it is already installed
+        # if the id and version matches, then we have already installed this package
+        # otherwise consider it as uninstalled
+        $packageFromHistory = $packageHistory | Where-Object { $_.ID -eq $packageXML.Package.id }
 
         foreach ($tempFile in $DownloadedExternalFiles) {
             if ($tempFile.Exists) {
                 $tempFile.Delete()
             }
         }
+
+        [LenovoPackage]@{
+            'ID'             = $packageXML.Package.id
+            'Category'       = $packageURL.category
+            'Title'          = $packageXML.Package.Title.Desc.'#text'
+            'Version'        = $version
+            'Vendor'         = $packageXML.Package.Vendor
+            'Severity'       = $packageXML.Package.Severity.type
+            'RebootType'     = $packageXML.Package.Reboot.type
+            'URL'            = $packageURL.location
+            'Extracter'      = $packageXML.Package
+            'Installer'      = [PackageInstallInfo]::new($packageXML.Package, $packageURL.category)
+            'IsApplicable'   = Resolve-XMLDependencies -PackageID $packageXML.Package.id -XML $packageXML.Package.Dependencies -FailUnsupportedDependencies:$FailUnsupportedDependencies -DebugLogFile $DebugLogFile
+            'IsInstalled'    = if ($null -eq $packageFromHistory) { $false } else { $packageFromHistory.IsInstalled -and $packageFromHistory.Version -eq $version }
+            'DetectedVersion' = if ($null -eq $packageFromHistory -or $packageFromHistory.Version -eq $version) { $null } else { $packageFromHistory.Version}
+        }
     }
-    
+
+    if ($All) {
+        if ($CacheFile -ne $null) { Update-LSUCache -Filename $CacheFile -Packages $packagesCollection}
+        return $packagesCollection
+    }
+    else {
+        $filteredPackages = $packagesCollection.Where{ $_.IsApplicable -and -not $_.IsInstalled }
+        if ($CacheFile -ne $null) { Update-LSUCache -Filename $CacheFile -Packages $filteredPackages}
+        return $filteredPackages
+    }
+
     $webClient.Dispose()
 }
 
@@ -528,11 +721,11 @@ function Save-LSUpdate {
         [switch]$Force,
         [System.IO.DirectoryInfo]$Path = "$env:TEMP\LSUPackages"
     )
-    
+
     begin {
         $transfers = [System.Collections.Generic.List[System.Threading.Tasks.Task]]::new()
     }
-    
+
     process {
         foreach ($PackageToGet in $Package) {
             $DownloadDirectory = Join-Path -Path $Path -ChildPath $PackageToGet.id
@@ -554,7 +747,7 @@ function Save-LSUpdate {
             }
         }
     }
-    
+
     end {
         if ($ShowProgress -and $transfers) {
             Show-DownloadProgress -Transfers $transfers
@@ -571,7 +764,7 @@ function Save-LSUpdate {
             }
             Write-Error $errorString
         }
-        
+
         foreach ($webClient in $transfers) {
             $webClient.Dispose()
         }
@@ -609,18 +802,36 @@ function Install-LSUpdate {
         If a BIOS update is successfully installed, write information about it to 'HKLM\Software\LSUClient\BIOSUpdate'.
         This is useful in automated deployment scenarios, especially the 'ActionNeeded' key which will tell you whether a shutdown or reboot is required to apply the BIOS update.
         The created registry values will not be deleted by this module, only overwritten on the next installed BIOS Update.
+
+        .PARAMETER PackageId
+        Used in conjunction with param CacheFile.  Optionally pass a PackageId along with a cache file to pull a packager from the cache file
+
+        .PARAMETER CacheFile
+        Used in conjunction with param PackageId.  Optionally pass a PackageId along with a cache file to pull a packager from the cache file
     #>
 
 	[CmdletBinding()]
     Param (
-        [Parameter( Position = 0, ValueFromPipeline = $true, Mandatory = $true )]
+        [Parameter( Position = 0, ValueFromPipeline = $true )]
         [pscustomobject]$Package,
+        [string]$PackageId,
+        [string]$CacheFile,
         [ValidateScript({ Test-Path -LiteralPath $_ -PathType Container })]
         [System.IO.DirectoryInfo]$Path = "$env:TEMP\LSUPackages",
         [switch]$SaveBIOSUpdateInfoToRegistry
     )
-    
+
     process {
+        # if packageId and a cache file was provided then get the package from the cache
+        if ($null -ne $PackageId -and $null -ne $CacheFile) {
+            $cache = Get-LSUCache -Filename $CacheFile
+            $Package = $cache | Where-Object { $_.ID -eq $PackageId }
+            if ($null -eq $Package) {
+                Write-Error "$PackageId not found in cache $CacheFile"
+                return
+            }
+        }
+
         foreach ($PackageToProcess in $Package) {
             $PackageDirectory = Join-Path -Path $Path -ChildPath $PackageToProcess.id
             if (-not (Test-Path -LiteralPath (Join-Path -Path $PackageDirectory -ChildPath $PackageToProcess.Extracter.FileName) -PathType Leaf)) {
@@ -629,17 +840,22 @@ function Install-LSUpdate {
             }
 
             Expand-LSUpdate -Package $PackageToProcess -Path $PackageDirectory
-            
+
             Write-Verbose "Installing package $($PackageToProcess.ID) ...`r`n"
+
+            $errorMessage = "";
 
             if ($PackageToProcess.Category -eq 'BIOS UEFI') {
                 # We are dealing with a BIOS Update
                 [BiosUpdateInfo]$BIOSUpdateExit = Install-BiosUpdate -PackageDirectory $PackageDirectory
                 if ($BIOSUpdateExit.WasRun -eq $true) {
                     if ($BIOSUpdateExit.ExitCode -notin $PackageToProcess.Installer.SuccessCodes) {
-                        Write-Warning "Unattended BIOS/UEFI update FAILED with return code $($BIOSUpdateExit.ExitCode)!`r`n"
+                        $errorMessage = "Unattended BIOS/UEFI update FAILED with return code $($BIOSUpdateExit.ExitCode)!`r`n"
+                        Write-Warning $errorMessage
                         if ($BIOSUpdateExit.LogMessage) {
-                            Write-Warning "The following information was collected:`r`n$($BIOSUpdateExit.LogMessage)`r`n"
+                            $logMessage + "The following information was collected:`r`n$($BIOSUpdateExit.LogMessage)`r`n"
+                            $errorMessage = $errorMessage + $logMessage
+                            Write-Warning $logMessage
                         }
                     } else {
                         # BIOS Update successful
@@ -647,9 +863,11 @@ function Install-LSUpdate {
                         if ($SaveBIOSUpdateInfoToRegistry) {
                             Set-BIOSUpdateRegistryFlag -Timestamp $BIOSUpdateExit.Timestamp -ActionNeeded $BIOSUpdateExit.ActionNeeded -PackageHash (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path -Path $PackageDirectory -ChildPath $Package.Extracter.FileName)).Hash
                         }
+                        $Package.IsInstalled = $true
                     }
                 } else {
-                    Write-Warning "Either this is not a BIOS Update or it's an unsupported installer for one, skipping installation!`r`n"
+                    $errorMessage = "Either this is not a BIOS Update or it's an unsupported installer for one, skipping installation!`r`n"
+                    Write-Warning $errorMessage
                 }
             } else {
                 switch ($PackageToProcess.Installer.InstallType) {
@@ -658,7 +876,10 @@ function Install-LSUpdate {
                         $InstallCMD     = $PackageToProcess.Installer.Command -replace '-overwirte', '-overwrite'
                         $installProcess = Invoke-PackageCommand -Path $PackageDirectory -Command $InstallCMD
                         if ($installProcess.ExitCode -notin $PackageToProcess.Installer.SuccessCodes) {
-                            Write-Warning "Installation of package '$($PackageToProcess.id) - $($PackageToProcess.Title)' FAILED with return code $($installProcess.ExitCode)!`r`n"
+                            $errorMessage =  "Installation of package '$($PackageToProcess.id) - $($PackageToProcess.Title)' FAILED with return code $($installProcess.ExitCode)!`r`n"
+                            Write-Warning $errorMessage
+                        } else {
+                            $Package.IsInstalled = $true
                         }
                     }
                     'INF' {
@@ -666,14 +887,20 @@ function Install-LSUpdate {
                         # pnputil is a documented Microsoft tool and Exit code 0 means SUCCESS while 3010 means SUCCESS but reboot required,
                         # however Lenovo does not always include 3010 as an OK return code - that's why we manually check against it here
                         if ($installProcess.ExitCode -notin $PackageToProcess.Installer.SuccessCodes -and $installProcess.ExitCode -notin 0, 3010) {
-                            Write-Warning "Installation of package '$($PackageToProcess.id) - $($PackageToProcess.Title)' FAILED with return code $($installProcess.ExitCode)!`r`n"
+                            $errorMessage = "Installation of package '$($PackageToProcess.id) - $($PackageToProcess.Title)' FAILED with return code $($installProcess.ExitCode)!`r`n"
+                            Write-Warning $errorMessage
+                        } else {
+                            $Package.IsInstalled = $true
                         }
                     }
                     default {
-                        Write-Warning "Unsupported package installtype '$_', skipping installation ...`r`n"
+                        $errorMessage = "Unsupported package installtype '$_', skipping installation ...`r`n"
+                        Write-Warning $errorMessage
                     }
                 }
             }
+            # update history file
+            Update-LSUHistory -Package $Package -ErrorMessage $errorMessage
         }
     }
 }
